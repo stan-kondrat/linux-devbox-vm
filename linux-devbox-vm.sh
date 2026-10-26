@@ -547,6 +547,8 @@ for f in $X/usr/bin/*; do
 	b=/bin/${f##*/}
 	[ -e $b ] && [ ! -L $b ] || ln -sfn $f $b
 done
+# Debian's git runs 'pager' (Debian's alternatives name) unless told otherwise
+[ -e /bin/pager ] && [ ! -L /bin/pager ] || ln -sfn less /bin/pager
 mkdir -p /usr/lib /usr/share /etc/ssl/certs
 ln -sfn $X/usr/lib/git-core /usr/lib/git-core
 ln -sfn $X/usr/share/git-core /usr/share/git-core
@@ -601,6 +603,14 @@ else
 	echo missing >$S/sshd
 fi
 
+# RAM disk for the Theia IDE and Node.js (theia.sh copies them there): the
+# share answers every file access with a round trip to the Mac, hundreds of
+# times slower than tmpfs for the IDE's thousands of small files. Unlike
+# /dev/shm it allows running programs.
+mkdir -p /opt/devbox
+mountpoint -q /opt/devbox || mount -t tmpfs -o size=2g,mode=755 tmpfs /opt/devbox
+chown $DEVBOX_UID:$DEVBOX_GID /opt/devbox
+
 # Theia: runit service, run as the user. Defined in /etc/sv and linked into
 # /etc/service, so runsvdir never sees a half-written service
 mkdir -p /etc/sv/theia
@@ -630,12 +640,13 @@ EOF
 
 cat >shared/devbox/env.sh <<'EOF'
 # Environment of the devbox user: Theia's build and server, login shells
-# (~/.bash_profile, ~/.bashrc, $BASH_ENV for ssh). Node.js comes from the
-# shared folder (the libraries it needs are copied to /lib by boot.sh); npm
-# cache and temp files live there too (the root disk is 256 MB).
+# (~/.bash_profile, ~/.bashrc, $BASH_ENV for ssh). Node.js comes from its RAM
+# copy (theia.sh), until that exists from the shared folder; the libraries it
+# needs are copied to /lib by boot.sh. npm cache and temp files live in the
+# shared folder (the root disk is 256 MB).
 SH=/mnt/shared
 . $SH/devbox/guest.conf
-export PATH=$SH/node/bin:/bin
+export PATH=/opt/devbox/node/bin:$SH/node/bin:/bin
 export HOME=$SH/home/$DEVBOX_USER USER=$DEVBOX_USER LOGNAME=$DEVBOX_USER SHELL=/bin/bash
 # Sockets cannot live on the share; boot.sh creates this tmpfs dir
 export XDG_RUNTIME_DIR=/run/user/$DEVBOX_UID
@@ -651,12 +662,15 @@ EOF
 cat >shared/devbox/theia.sh <<'EOF'
 #!/bin/sh
 # Eclipse Theia server, run as the devbox user by the runit service "theia"
-# (boot.sh). Builds Theia first when that is not done yet (build.sh).
+# (boot.sh). Builds Theia first when that is not done yet (build.sh), then
+# runs it from a RAM copy.
 . /mnt/shared/devbox/env.sh
 L=$SH/devbox/logs
+R=/opt/devbox
 mkdir -p "$L/build" "$SH/workspace"
-# No RTC: the clock is at 1970 until vm.sh sets it, and HTTPS needs it
-until [ "$(date +%s)" -gt 1700000000 ]; do sleep 5; done
+# Wait for vm.sh start: it sets the clock (the VM boots at 1970, and HTTPS
+# needs the right time), then boot.sh mounts the RAM disk
+until [ "$(date +%s)" -gt 1700000000 ] && mountpoint -q $R; do sleep 5; done
 if [ ! -e "$L/build/build.done" ]; then
 	if ! sh "$SH/devbox/build.sh" >>"$L/build.log" 2>&1; then
 		# Keep runit from restarting the build in a loop; vm.sh restart-theia retries
@@ -664,16 +678,29 @@ if [ ! -e "$L/build/build.done" ]; then
 		exec sleep infinity
 	fi
 fi
-cd "$SH/theia/examples/browser"
 # node-pty ships a prebuilt linux-arm64 addon; the bundle's loader looks for
 # it next to lib/backend
-P=prebuilds/linux-arm64
-[ -e "lib/backend/$P/pty.node" ] ||
-	{ mkdir -p "lib/backend/$P"; cp "$SH/theia/node_modules/node-pty/$P/pty.node" "lib/backend/$P/"; }
-exec node -r "$SH/devbox/native-stubs.js" lib/backend/main.js "$SH/workspace" \
+B=$SH/theia/examples/browser/lib/backend/prebuilds/linux-arm64
+[ -e "$B/pty.node" ] ||
+	{ mkdir -p "$B"; cp "$SH/theia/node_modules/node-pty/prebuilds/linux-arm64/pty.node" "$B/"; }
+# RAM copy of what the server reads: its bundled code (lib/), the plugins and
+# Node.js. Copied again after a rebuild; node_modules stays in the share (at
+# run time the server only loads @parcel/watcher's addon from it).
+stamp="$(stat -c %Y "$L/build/build.done" "$SH/node/bin/node" | tr '\n' ' ')"
+if [ "$(cat $R/.stamp 2>/dev/null)" != "$stamp" ]; then
+	echo "copying the Theia IDE and Node.js to RAM ($R)"
+	rm -rf $R/node $R/theia $R/.stamp
+	mkdir -p $R/theia/sample-plugins
+	(cd $SH && tar -cf - node) | tar -xf - -C $R
+	(cd $SH/theia && tar -cf - plugins examples/browser examples/ovsx-router-config.json) | tar -xf - -C $R/theia
+	ln -s $SH/theia/node_modules $R/theia/node_modules
+	echo "$stamp" >$R/.stamp
+fi >"$L/theia.log" 2>&1
+cd $R/theia/examples/browser
+exec $R/node/bin/node -r "$SH/devbox/native-stubs.js" lib/backend/main.js "$SH/workspace" \
 	--hostname=0.0.0.0 --port="$THEIA_PORT" --log-config=log-config.json \
-	--plugins=local-dir:"$SH/theia/plugins" --ovsx-router-config=../ovsx-router-config.json \
-	>"$L/theia.log" 2>&1
+	--plugins=local-dir:$R/theia/plugins --ovsx-router-config=../ovsx-router-config.json \
+	>>"$L/theia.log" 2>&1
 EOF
 
 cat >shared/devbox/build.sh <<'EOF'
